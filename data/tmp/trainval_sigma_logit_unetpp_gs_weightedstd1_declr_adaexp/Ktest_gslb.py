@@ -36,7 +36,12 @@ import ssl
 import cv2
 ssl._create_default_https_context = ssl._create_unverified_context
 from torch.distributions import Normal, Independent
+import os.path as osp
+import SimpleITK as sitk
+import scipy.io as sio
 # os.environ["CUDA_LAUNCH_BLOCKING"]="1"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
 parser = argparse.ArgumentParser(description='PyTorch Training')
 parser.add_argument('--batch_size', default=4, type=int, metavar='BT',
                     help='batch size')
@@ -62,6 +67,9 @@ parser.add_argument('--itersize', default=1, type=int,
 parser.add_argument('--std_weight', default=1, type=float,help='weight for std loss')
 
 parser.add_argument('--distribution', default="gs", type=str, help='the output distribution')
+# parser.add_argument('--checkpoint', default='data/tmp/trainval_sigma_logit_unetpp_gs_weightedstd1_declr_adaexp/epoch-19-training-record/epoch-19-checkpoint.pth', type=str, help='path to latest checkpoint')
+parser.add_argument('--checkpoint', default='epoch-19-checkpoint.pth', type=str, help='path to latest checkpoint')
+parser.add_argument('--save-dir', help='output folder', default='results/UAED')
 
 args = parser.parse_args()
 
@@ -130,11 +138,11 @@ def main():
     args.cuda = True
     # train_dataset = BSDS_RCFLoader(root=args.dataset, split= "train")
     # test_dataset = BSDS_RCFLoader(root=args.dataset,  split= "test")
-    train_dataset = Study_RCFLoader(root=args.dataset, split="train")
+    # train_dataset = Study_RCFLoader(root=args.dataset, split="train")
     # test_dataset = Study_RCFLoader(root=args.dataset, split="test")
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size,
-        num_workers=8, drop_last=True,shuffle=True)
+    # train_loader = DataLoader(
+    #     train_dataset, batch_size=args.batch_size,
+    #     num_workers=8, drop_last=True,shuffle=True)
     # test_loader = DataLoader(
     #     test_dataset, batch_size=1,
     #     num_workers=8, drop_last=True,shuffle=False)
@@ -150,20 +158,31 @@ def main():
 
     log = Logger(join(TMP_DIR, '%s-%d-log.txt' %('Adam',args.LR)))
     sys.stdout = log
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.LR,weight_decay=args.weight_decay)
-    
-    for epoch in range(args.start_epoch, args.maxepoch):
-        # if epoch==0:
-        #     test(model, test_loader, epoch=epoch, test_list=test_list,
-        #     save_dir = join(TMP_DIR, 'epoch-%d-testing-record-view' % epoch))
-        train(train_loader, model, optimizer,epoch,
-            save_dir = join(TMP_DIR, 'epoch-%d-training-record' % epoch))
-        # test(model, test_loader, epoch=epoch, test_list=test_list,
-        #     save_dir = join(TMP_DIR, 'epoch-%d-testing-record-view' % epoch))
-        # multiscale_test(model, test_loader, epoch=epoch, test_list=test_list,
-        #     save_dir = join(TMP_DIR, 'epoch-%d-testing-record' % epoch))
-        log.flush() # write log
+    if osp.isfile(args.checkpoint):
+        print("=> loading checkpoint from '{}'".format(args.checkpoint))
+        checkpoint = torch.load(args.checkpoint)
+        model.load_state_dict(checkpoint['state_dict'])
+        print("=> checkpoint loaded")
+    else:
+        print("=> no checkpoint found at '{}'".format(args.checkpoint))
+
+    print('Performing the testing...')
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.LR,weight_decay=args.weight_decay)
+    #
+    # for epoch in range(args.start_epoch, args.maxepoch):
+    #     # if epoch==0:
+    #     #     test(model, test_loader, epoch=epoch, test_list=test_list,
+    #     #     save_dir = join(TMP_DIR, 'epoch-%d-testing-record-view' % epoch))
+    #     train(train_loader, model, optimizer,epoch,
+    #         save_dir = join(TMP_DIR, 'epoch-%d-training-record' % epoch))
+    #     # test(model, test_loader, epoch=epoch, test_list=test_list,
+    #     #     save_dir = join(TMP_DIR, 'epoch-%d-testing-record-view' % epoch))
+    #     # multiscale_test(model, test_loader, epoch=epoch, test_list=test_list,
+    #     #     save_dir = join(TMP_DIR, 'epoch-%d-testing-record' % epoch))
+    #     log.flush() # write log
+    medical_image_test_multi(model, 'D:/Keenster/MatlabScripts/KeensterSSM/Study_54/Study_54.nii.gz', args.save_dir)
+    log.flush() # write log
+
 
 
 def train(train_loader, model,optimizer,epoch, save_dir):
@@ -324,6 +343,128 @@ def multiscale_test(model, test_loader, epoch, test_list, save_dir):
             os.makedirs(mat_save_dir)
         result_png.save(join(png_save_dir, "%s.png" % filename))
         io.savemat(join(mat_save_dir, "%s.mat" % filename),{'result':result},do_compression=True)
+
+def medical_image_test_multi(model, test_img, save_dir):
+    model.eval()
+    if not osp.isdir(save_dir):
+        os.makedirs(save_dir)
+    scale = [0.5,1,1.5]#注意：（400,400）大小的图像，内存已经不够用了，因此部分样本在本机上不支持[0.5,1,1,5]，仅支持[0.5,1]或者[0.8]
+    # scale = [1, 2]
+    start_time = time.time()  # 程序开始时间
+
+    # 读取.nii.gz文件
+    image = sitk.ReadImage(test_img)
+
+    # 获取图像的大小和像素间距
+    size = image.GetSize()
+    spacing = image.GetSpacing()
+    # 将图像数据转换为numpy数组
+    array = sitk.GetArrayFromImage(image)
+    mat2save = np.zeros((size[0], size[1], size[2]), dtype=np.float32)
+    # array = array.transpose(1,2,0)
+    for z in range(size[2]):
+        torch.cuda.empty_cache()
+        # 提取当前横截面的图像数据
+        slice_array = array[z, ...]
+
+        # 将图像数据从浮点型转换为整型，并扩展亮度范围以在OpenCV中正确显示
+        slice_array = cv2.convertScaleAbs(slice_array, alpha=(255.0 / slice_array.max()))
+        # 将NumPy数组转换为OpenCV格式
+        img_cv = cv2.cvtColor(slice_array, cv2.COLOR_GRAY2RGB)
+        # # 提高对比度的参数
+        # alpha = 1.5  # 对比度增益
+        # beta = 0  # 亮度增益
+        # # 对图像应用对比度和亮度调整
+        # img_cv = cv2.convertScaleAbs(img_cv0, alpha=alpha, beta=beta)
+        # # 应用直方图均衡化
+        # # 将图像拆分为三个通道
+        # b, g, r = cv2.split(img_cv0)
+        #
+        # # 对每个通道应用直方图均衡化
+        # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # equalized_b = clahe.apply(b)
+        # equalized_g = clahe.apply(g)
+        # equalized_r = clahe.apply(r)
+        #
+        # # 合并通道
+        # img_cv = cv2.merge((equalized_b, equalized_g, equalized_r))
+
+        slice_array = torch.from_numpy(img_cv).cuda()
+        H, W, C = slice_array.shape
+        # r, g, b = cv2.split(img_cv)
+        # # 计算每个通道的均值
+        # mean_b = np.mean(b)
+        # mean_g = np.mean(g)
+        # mean_r = np.mean(r)
+        # mean = np.array([mean_r, mean_g, mean_b], dtype=np.float32)
+        meanind = np.array([104.00698793, 116.66876762, 122.67891434], dtype=np.float32)  # from RCF BSDS_Dataset
+        # mean = torch.tensor(mean, dtype=torch.float32)
+
+        ms_fuse = np.zeros((H, W), np.float32)
+        for k in range(len(scale)):
+            im0_ = cv2.resize(img_cv, None, fx=scale[k], fy=scale[k], interpolation=cv2.INTER_LINEAR)
+            im1_ = im0_ - meanind
+            im_ = im1_.transpose((2, 0, 1))
+
+            # results = model(torch.unsqueeze(torch.from_numpy(im_).to(torch.float32).cuda(), 0))
+            # fuse_res = torch.squeeze(results[-1].detach()).cpu().numpy()
+            # fuse_res = cv2.resize(fuse_res, (W, H), interpolation=cv2.INTER_LINEAR)
+            # ms_fuse += fuse_res
+            mean, std = model(torch.unsqueeze(torch.from_numpy(im_).to(torch.float32).cuda(), 0))
+            outputs_dist = Independent(Normal(loc=mean, scale=std + 0.001), 1)
+            outputs = torch.sigmoid(outputs_dist.rsample())
+            result = torch.squeeze(outputs.detach()).cpu().numpy()
+            fuse = cv2.resize(result, (W, H), interpolation=cv2.INTER_LINEAR)
+            ms_fuse += fuse
+        ms_fuse = ms_fuse / len(scale)
+
+        mat2save[:, :, z] = ms_fuse
+
+        ms_fuse = (ms_fuse * 255).astype(np.uint8)
+
+        # 显示当前横截面
+        # cv2.imshow("Slice {} ori".format(z), img_cv)
+        # cv2.waitKey(0)  # 按任意键停止显示当前横截面
+        # cv2.imshow("Slice {} ori2".format(z), im0_)
+        # cv2.waitKey(0)  # 按任意键停止显示当前横截面
+        # cv2.imshow("Slice {} preprocess".format(z), im1_)
+        # cv2.waitKey(0)  # 按任意键停止显示当前横截面
+        cv2.imshow("Slice {} final".format(z), ms_fuse)
+        cv2.waitKey(0)  # 按任意键停止显示当前横截面
+
+    cv2.destroyAllWindows()  # 关闭所有OpenCV窗口
+    # new_filename = test_img.replace('.nii.gz', '_cnnedge.mat')
+
+    end_time = time.time()  # 程序结束时间
+    run_time = end_time - start_time  # 程序的运行时间，单位为秒
+    print('infer time:')
+    print(run_time)
+    new_filename = test_img.replace('.nii.gz', '_cnnedgeUAED.mat')
+
+    # # 论文作图阶段
+    # fig = plt.figure()
+    # # 定义画布为1*1个划分，并在第1个位置上进行作图
+    # ax = fig.add_subplot(111)
+    # # 定义横纵坐标的刻度
+    # # ax.set_yticks(range(len(yLabel)))
+    # # ax.set_yticklabels(yLabel, fontproperties=font)
+    # # ax.set_xticks(range(len(xLabel)))
+    # # ax.set_xticklabels(xLabel)
+    # # 作图并选择热图的颜色填充风格，这里选择hot
+    # slice = 30
+    # im = ax.imshow(mat2save[:,:,slice], cmap=plt.cm.viridis)
+    # # 增加右侧的颜色刻度条
+    # plt.colorbar(im)
+    # # 增加标题
+    # plt.title('probablity map of  slice: ' + str(slice), fontproperties=font)
+    # # show
+    # plt.show()
+
+    sio.savemat(
+        new_filename,
+        {"CNNEdgeMap": mat2save})
+    print('Running medical test done')
+
 if __name__ == '__main__':
     main()
    
